@@ -6,6 +6,11 @@
 
 # COMMAND ----------
 
+display(dbutils.secrets.listScopes())
+dbutils.secrets.list(scope="lakevault-secret")
+
+# COMMAND ----------
+
 import uuid
 import json
 import ast
@@ -18,17 +23,21 @@ from pyspark.sql.types import StringType,DateType,LongType,IntegerType,Timestamp
 from multiprocessing.pool import ThreadPool
 
 #JDBC connect details for SQL Server database
-jdbcHostname = "lakeserv.database.windows.net"
-jdbcDatabase = "salesnm"
-jdbcUsername = "nizadmin"
+jdbcHostname = "tjxserv.database.windows.net"
+jdbcDatabase = "tjxsalesdb"
+jdbcUsername = "tjxadmin"
 jdbcPort = "1433"
 
-writeConfig = {
-    "Endpoint": "https://elksales.documents.azure.com:443/",
-    "Masterkey": dbutils.secrets.get(scope = "lake-vault-secret", key = "CosmosKey"),
-    "Database": "SalesDb",
-    "Collection": "Orders",
-    "Upsert": "true"
+
+cosmosEndpoint = "https://tjx.documents.azure.com:443/"
+cosmosDatabaseName = "SalesDb"
+cosmosContainerName = "Orders"
+
+cfg = {
+  "spark.cosmos.accountEndpoint" : cosmosEndpoint,
+  "spark.cosmos.accountKey" : dbutils.secrets.get(scope = "lakevault-secret", key = "CosmosKey"),
+  "spark.cosmos.database" : cosmosDatabaseName,
+  "spark.cosmos.container" : cosmosContainerName,
 }
 
 #get all orders
@@ -36,9 +45,8 @@ orders = (spark.read
   .format("sqlserver")
   .option("host", jdbcHostname)
   .option("user", jdbcUsername )
-  #.option("password", "Ceird123")
-  .option("password", dbutils.secrets.get(scope = 'lake-vault-secret', key = 'sqlpwd'))
-  .option("database", "salesnm")
+  .option("password", dbutils.secrets.get(scope = 'lakevault-secret', key = 'sqlpwd'))
+  .option("database", jdbcDatabase)
   .option("dbtable", "SalesLT.SalesOrderHeader") # (if schemaName not provided, default to "dbo")
   .load()
 )
@@ -48,9 +56,8 @@ orderdetails = (spark.read
   .format("sqlserver")
   .option("host", jdbcHostname)
   .option("user", jdbcUsername )
-  #.option("password", "Ceird123")
-  .option("password", dbutils.secrets.get(scope = 'lake-vault-secret', key = 'sqlpwd'))
-  .option("database", "salesnm")
+  .option("password", dbutils.secrets.get(scope = 'lakevault-secret', key = 'sqlpwd'))
+  .option("database", jdbcDatabase)
   .option("dbtable", "SalesLT.SalesOrderDetail") # (if schemaName not provided, default to "dbo")
   .load()
 )
@@ -61,49 +68,11 @@ orderids = orders.select('SalesOrderID').collect()
 #create thread pool big enough to process merge of details to orders in parallel
 pool = ThreadPool(10)
 
-# COMMAND ----------
-
-display(orderdetails)
-
-# COMMAND ----------
-
-from pyspark.sql import SparkSession
-
-# Initialize Spark Session
-spark = SparkSession.builder.getOrCreate()
-
-
-#JDBC connect details for SQL Server database
-jdbcHostname = "lakeserv.database.windows.net"
-jdbcDatabase = "salesnm"
-jdbcUsername = "nizadmin"
-jdbcPort = "1433"
-
-jdbcUrl = f"jdbc:sqlserver://{jdbcHostname}:{jdbcPort};database={jdbcDatabase}"
-
-# Define connection properties
-connectionProperties = {
-  "user" : jdbcUsername,
-  "password" : dbutils.secrets.get(scope = 'lake-vault-secret', key = 'sqlpwd'),
-  "driver" : "com.microsoft.sqlserver.jdbc.SQLServerDriver"
-}
-
-# Define SQL query
-query = """SELECT o.SalesOrderID, o.UnitPrice, 
-(SELECT od.SalesOrderID FROM SalesOrderDetail od WHERE od.SalesOrderID = o.SalesOrderID FOR JSON AUTO) as OrderDetails 
-FROM SalesOrderHeader o
-"""
-
-# Execute query and load result into DataFrame
-orders = spark.read.jdbc(url=jdbcUrl, table=query, properties=connectionProperties)
-
-# Display DataFrame
-orders.show()
-
 
 # COMMAND ----------
 
 def writeOrder(orderid):
+  #order = orders.filter(col('SalesOrderID').isin(orderid))  
   order = orders.filter(orders['SalesOrderID'] == orderid[0])
   #set id to be a uuid
   order = order.withColumn("id", lit(str(uuid.uuid1())))
@@ -145,8 +114,7 @@ def writeOrder(orderid):
   df = spark.read.json(sc.parallelize([orderjsondata]))
 
     #write the dataframe (this will be a single order record with merged many-to-one order details) to cosmos db using spark the connector
-  #https://docs.microsoft.com/en-us/azure/cosmos-db/spark-connector
-  df.write.format("com.microsoft.azure.cosmosdb.spark").mode("append").options(**writeConfig).save()
+  df.write.format("cosmos.oltp").mode("append").options(**cfg).save()
 
 
 
